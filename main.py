@@ -7,7 +7,7 @@ from typing import Optional
 # 🔧 TOGGLES (no CLI args)
 # =========================
 RUN_MONTHLY = True              # run the long month/day scheduler step?
-SCHEDULE_MODE = "days"          # "days" or "months" (used only if RUN_MONTHLY=True)
+SCHEDULE_MODE = "months"          # "days" or "months" (used only if RUN_MONTHLY=True)
 
 # If SCHEDULE_MODE == "days"
 DAYS_TO_RUN = 5
@@ -23,6 +23,7 @@ MONTHS_START_MONTH = 1
 # ======================================
 # 📁 DIRECTORIES — EDIT THESE IN ONE PLACE
 # ======================================
+RUN_NAME = "2MON_COT"
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 
 # 👇 NEW: force everything under PROJECT_ROOT/data
@@ -34,19 +35,19 @@ DIR_CLOSURES     = os.path.join(DATA_ROOT, "closures")                    # per-
 PATH_PORTAL_WEIGHTS = os.path.join(DIR_SOURCE_NET, "portal_weights.json") # portal weights used in both runners
 
 # Monthly/Days runner (its outputs live under run_dir/months/YYYY-MM/day_##)
-DIR_MONTH_RUN        = os.path.join(DATA_ROOT, "5DAY_C")
+DIR_MONTH_RUN        = os.path.join(DATA_ROOT, RUN_NAME)
 DIR_MONTHS_UNDER_RUN = os.path.join(DIR_MONTH_RUN, "months")
 DIR_MONTH_CONFIG     = os.path.join(DIR_MONTH_RUN, "config")
 DIR_MONTH_MERGED     = os.path.join(DIR_MONTH_RUN, "merged")              # where merged outputs go (labels/readings)
 
 # If you already have an external months tree (when RUN_MONTHLY=False)
-DIR_EXISTING_MONTHS = os.path.join(DATA_ROOT, "5DAY_C", "months")
+DIR_EXISTING_MONTHS = os.path.join(DATA_ROOT, RUN_NAME, "months")
 DIR_EXISTING_MERGED = os.path.join(DATA_ROOT, "OT", "merged")
 
 # Combined artifacts
 DIR_COMBINED_OUT   = os.path.join(DATA_ROOT, "combined_outputs")
 PATH_DISTANCE_CSV  = os.path.join(DIR_COMBINED_OUT, "sensor_distance_matrix.csv")
-DIR_DESPT_OUT      = os.path.join(DIR_COMBINED_OUT, "DESPT", "5DAY_C")
+DIR_DESPT_OUT      = os.path.join(DIR_COMBINED_OUT, "DESPT", RUN_NAME)
 
 # Optional (if you later compute a closure effect matrix CSV to convert)
 PATH_EFFECT_MATRIX_CSV: Optional[str] = None   # e.g., os.path.join(DIR_COMBINED_OUT, "closure_effect_matrix.csv")
@@ -142,8 +143,9 @@ def run_all():
                 bin_sec=300,
                 net_dir=DIR_SOURCE_NET,
                 run_dir=DIR_MONTH_RUN,
-                sim_seconds=24*3600,
+                sim_seconds=24 * 3600,
 
+                # Demand
                 demand_mode="daily_target",
                 base_spawn_rate_total=0.8,
                 target_daily_veh=86400,
@@ -151,19 +153,34 @@ def run_all():
                 max_veh_per_sec_total=2.0,
                 diurnal_peak_clamp=None,
 
-                n_closures=5,
-                close_min_dur_s=30*60,
-                close_max_dur_s=8*60*60,
-                close_start_guard_s=10*60,
+                # --- Closures (legacy + new controls) ---
+                n_closures=5,                      # legacy, no longer used directly
+                close_min_dur_s=30 * 60,
+                close_max_dur_s=8 * 60 * 60,
+                close_start_guard_s=10 * 60,
                 exclude_portal_edges_from_closure=True,
                 allow_cross_day=True,
                 retarget_before_reroute=True,
 
-                closure_global_start=(2025, 1, 1),
-                deferred_closure_start=(2024, 3, 1),
+                # New global closure controls:
+                # - pick 5 edges once; only these can ever be closed
+                # - every day is a closure day (period=1)
+                # - each edge has 50% chance to be closed on a closure day
+                closure_pool_size=5,
+                closure_day_period=1,
+                closure_edge_prob=0.5,
+
+                # Late subset: 2 of those 5 edges only appear in the last 30% of the schedule
+                late_closure_pool_size=2,
+                late_closure_start_frac=0.7,
+
+                # Date gates
+                closure_global_start=(2025, 1, 1),    # (Y, M, D)
+                deferred_closure_start=(2024, 3, 1),  # (Y, M, D)
                 deferred_edge_ids=set(),
                 deferred_edge_prefixes=[],
 
+                # Portal weights
                 weight_mode="uniform",
                 custom_weights={"origin": {}, "sink": {}},
 
@@ -181,8 +198,9 @@ def run_all():
                 bin_sec=300,
                 net_dir=DIR_SOURCE_NET,
                 run_dir=DIR_MONTH_RUN,
-                sim_seconds=24*3600,
+                sim_seconds=24 * 3600,
 
+                # Demand
                 demand_mode="daily_target",
                 base_spawn_rate_total=0.8,
                 target_daily_veh=86400,
@@ -190,19 +208,32 @@ def run_all():
                 max_veh_per_sec_total=2.0,
                 diurnal_peak_clamp=None,
 
-                n_closures=5,
-                close_min_dur_s=30*60,
-                close_max_dur_s=8*60*60,
-                close_start_guard_s=10*60,
+                # --- Closures (legacy + new controls) ---
+                n_closures=5,                      # legacy, no longer used directly
+                close_min_dur_s=2 * 60 * 60,
+                close_max_dur_s=14 * 60 * 60,
+                close_start_guard_s=10 * 60,
                 exclude_portal_edges_from_closure=True,
                 allow_cross_day=True,
                 retarget_before_reroute=True,
 
-                closure_global_start=(2025, 1, 1),
-                deferred_closure_start=(2024, 3, 1),
+                # New global closure controls:
+                # For long multi-month runs, maybe a slightly larger pool:
+                closure_pool_size=10,              # 10 edges can ever be closed
+                closure_day_period=1,              # closures considered every day
+                closure_edge_prob=0.3,             # per-edge closure prob on closure days
+
+                # Late subset: a few edges that only start appearing in later part of the run
+                late_closure_pool_size=3,
+                late_closure_start_frac=0.7,
+
+                # Date gates
+                closure_global_start=(2025, 2, 11),   # (Y, M, D)
+                deferred_closure_start=(2024, 3, 1),  # (Y, M, D)
                 deferred_edge_ids=set(),
                 deferred_edge_prefixes=[],
 
+                # Portal weights
                 weight_mode="uniform",
                 custom_weights={"origin": {}, "sink": {}},
 

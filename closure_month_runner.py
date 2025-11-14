@@ -72,13 +72,21 @@ class MonthRunnerConfig:
     diurnal_peak_clamp: Optional[float] = None
 
     # Closures
-    n_closures: int = 5
+    n_closures: int = 5  # legacy: per-day number of closures (will be replaced by new scheme)
     close_min_dur_s: int = 30 * 60
     close_max_dur_s: int = 8 * 60 * 60
     close_start_guard_s: int = 10 * 60
     exclude_portal_edges_from_closure: bool = True
     allow_cross_day: bool = True
     retarget_before_reroute: bool = True
+
+    # New closure scheduling controls
+    closure_pool_size: Optional[int] = None     # if None → all edges in base_closure_pool
+    closure_day_period: int = 1                 # 1 = every day, 2 = every 2nd day, etc.
+    closure_edge_prob: float = 1.0              # per-edge probability on closure days (0–1)
+    late_closure_pool_size: Optional[int] = None  # subset of global pool that appears only later
+    late_closure_start_frac: float = 0.7        # fraction of schedule after which "late" edges become eligible
+
 
     # Date gates
     closure_global_start: Optional[Tuple[int, int, int]] = (2025, 3, 5)   # None to disable
@@ -627,6 +635,57 @@ def run_closure_month_runner(cfg: MonthRunnerConfig) -> dict:
         base_closure_pool.append((eid, fr, to))
     print(f"🛡️  Base closure pool sized: {len(base_closure_pool)} (excluded portals & corners).")
 
+    # ---- New: global closure pool + early/late subsets (fixed for the whole run) ----
+    all_edge_ids = [eid for (eid, _fr, _to) in base_closure_pool]
+
+    # Global closure set: edges that can EVER be closed
+    if not all_edge_ids:
+        global_closure_ids: List[str] = []
+    elif cfg.closure_pool_size is None or cfg.closure_pool_size <= 0 or cfg.closure_pool_size >= len(all_edge_ids):
+        # Use full pool
+        global_closure_ids = list(all_edge_ids)
+    else:
+        # Sample a fixed subset for the entire run
+        global_closure_ids = random.sample(all_edge_ids, cfg.closure_pool_size)
+
+    # Late subset: chosen once from the global set, never changes
+    late_closure_ids = set()
+    if cfg.late_closure_pool_size and cfg.late_closure_pool_size > 0 and len(global_closure_ids) > 1:
+        # Enforce "subset" semantics: keep at least one early edge if possible
+        max_late_size = len(global_closure_ids) - 1
+        late_size = min(cfg.late_closure_pool_size, max_late_size)
+        if late_size > 0:
+            late_closure_ids = set(random.sample(global_closure_ids, late_size))
+
+    early_closure_ids = [eid for eid in global_closure_ids if eid not in late_closure_ids]
+
+    print(
+        f"🧩 Global closure ids: {len(global_closure_ids)} "
+        f"(early={len(early_closure_ids)}, late={len(late_closure_ids)})"
+    )
+
+    # Pretty-print which exact edges were chosen (once per run)
+    # Build a small lookup from edge id -> (from, to)
+    edge_meta = {eid: (fr, to) for (eid, fr, to) in base_closure_pool}
+
+    def _fmt_edge(eid: str) -> str:
+        fr, to = edge_meta.get(eid, ("?", "?"))
+        return f"{eid} ({fr}->{to})"
+
+    if global_closure_ids:
+        print("   • Global closure edges:")
+        for eid in sorted(global_closure_ids):
+            tag = []
+            if eid in early_closure_ids:
+                tag.append("early")
+            if eid in late_closure_ids:
+                tag.append("late")
+            tag_str = f" [{' & '.join(tag)}]" if tag else ""
+            print(f"      - {_fmt_edge(eid)}{tag_str}")
+    else:
+        print("   • Global closure edges: NONE (no base_closure_pool).")
+
+
     # Demand scaling (month-independent base)
     if cfg.demand_mode == "daily_target":
         scale = compute_scale_for_daily_target(cfg.target_daily_veh, cfg.base_spawn_rate_total, cfg.diurnal_peak_clamp)
@@ -653,6 +712,16 @@ def run_closure_month_runner(cfg: MonthRunnerConfig) -> dict:
         dates = list(_iter_dates_days(cfg.start_year, cfg.start_month, cfg.start_day, cfg.days_to_run))
     else:
         dates = list(_iter_dates_months(cfg.start_year, cfg.start_month, cfg.num_months))
+
+    # New: when does the late subset become eligible?
+    if dates:
+        total_days = len(dates)
+        late_start_idx = int(total_days * cfg.late_closure_start_frac)
+        late_start_idx = max(0, min(late_start_idx, total_days))  # clamp for safety
+        print(f"⏱️  Late-closure subset activates at schedule index {late_start_idx} "
+              f"out of {total_days} day(s).")
+    else:
+        late_start_idx = 0
 
     months_run: List[str] = []
     days_run: List[str] = []
@@ -686,44 +755,105 @@ def run_closure_month_runner(cfg: MonthRunnerConfig) -> dict:
         # Deterministic per-day randomness
         random.seed(cfg.seed + (year * 10000 + month * 100 + day))
 
-        # Build today's closure pool (date gates)
+        # Build today's closure pool with:
+        #  - date gates (closure_global_start / deferred_closure_start)
+        #  - early/late subset depending on schedule index
+        #  - day-period gating (closure_day_period)
         today_tuple = (year, month, day)
-        closures_allowed_today = (cfg.closure_global_start is None) or _date_ge(today_tuple, cfg.closure_global_start)
-        todays_pool = list(base_closure_pool)
-        if cfg.deferred_closure_start is not None and not _date_ge(today_tuple, cfg.deferred_closure_start):
-            before = len(todays_pool)
-            todays_pool = [(eid, fr, to) for (eid, fr, to) in todays_pool if not _is_deferred_edge(cfg, eid)]
-            print(f"[{day_label}] 🔒 Deferred pool filter active until {cfg.deferred_closure_start}: "
-                  f"removed {before - len(todays_pool)} edges.")
+
+        # Date-based permission for closures at all (used for rollovers, too)
+        closures_allowed_by_date = (cfg.closure_global_start is None) or _date_ge(today_tuple, cfg.closure_global_start)
+
+        # Is this a "closure day" for NEW closures?
+        # (we still allow rollovers on non-closure days if date allows)
+        if cfg.closure_day_period <= 1:
+            closure_day_ok = closures_allowed_by_date
+        else:
+            closure_day_ok = closures_allowed_by_date and (idx % cfg.closure_day_period == 0)
+
+        # Choose which IDs are eligible TODAY ignoring defers:
+        #  - before late_start_idx → only early_closure_ids
+        #  - after late_start_idx  → early + late
+        if idx < late_start_idx:
+            base_ids_for_today = set(early_closure_ids)
+            phase_label = "early-only"
+        else:
+            base_ids_for_today = set(early_closure_ids) | late_closure_ids
+            phase_label = "early+late"
+
+        # Now intersect with base_closure_pool and apply deferred filter
+        todays_pool = []
+        if base_ids_for_today:
+            for (eid, fr, to) in base_closure_pool:
+                if eid not in base_ids_for_today:
+                    continue
+                # Deferred edges are excluded until deferred_closure_start
+                if cfg.deferred_closure_start is not None and not _date_ge(today_tuple, cfg.deferred_closure_start):
+                    if _is_deferred_edge(cfg, eid):
+                        continue
+                todays_pool.append((eid, fr, to))
+
+        print(
+            f"[{day_label}] Pool phase={phase_label}, "
+            f"closure_day_ok={closure_day_ok}, candidates_today={len(todays_pool)}"
+        )
+
 
         closures_csv = os.path.join(day_dir, f"closed_lanes_{year:04d}{month:02d}{day:02d}.csv")
         with open(closures_csv, "w", encoding="utf-8", newline="") as f:
             f.write("lane_id,start_s,end_s\n")
 
         closure_events: List[dict] = []
-        if closures_allowed_today and todays_pool:
-            edge_ids_pool = [eid for (eid, _fr, _to) in todays_pool]
-            chosen = random.sample(edge_ids_pool, k=min(cfg.n_closures, len(edge_ids_pool)))
-            for eid in chosen:
+
+        # --- New closure scheduling (per-edge probability, no cap) ---
+        if closure_day_ok and todays_pool and cfg.closure_edge_prob > 0.0:
+            # For each candidate edge today, flip a coin with prob=closure_edge_prob
+            # to decide whether it gets a closure.
+            scheduled_count = 0
+            random.shuffle(todays_pool)  # just to avoid any positional bias
+
+            for (eid, _fr, _to) in todays_pool:
+                if random.random() >= cfg.closure_edge_prob:
+                    continue
+
                 dur = random.randint(cfg.close_min_dur_s, cfg.close_max_dur_s)
                 if cfg.allow_cross_day:
                     start = random.randint(cfg.close_start_guard_s, cfg.sim_seconds - cfg.close_start_guard_s)
                 else:
                     latest_start = max(cfg.close_start_guard_s, cfg.sim_seconds - dur - cfg.close_start_guard_s)
-                    start = cfg.close_start_guard_s if latest_start <= cfg.close_start_guard_s else random.randint(cfg.close_start_guard_s, latest_start)
+                    start = cfg.close_start_guard_s if latest_start <= cfg.close_start_guard_s else random.randint(
+                        cfg.close_start_guard_s, latest_start
+                    )
                 end = start + dur
                 closure_events.append({"edge": eid, "start": start, "end": end, "active": False, "_handled": False})
+                scheduled_count += 1
 
-            print("🗓️  Closure schedule (edge, start→end, duration min):")
-            for c in sorted(closure_events, key=lambda z: z["start"]):
-                sM, sS = divmod(c["start"], 60); eM, eS = divmod(c["end"], 60)
-                print(f"  • {c['edge']}: {sM:02d}:{sS:02d} → {eM:02d}:{eS:02d}  (~{(c['end']-c['start'])//60}m)")
+            if scheduled_count > 0:
+                print(f"🗓️  Closure schedule ({scheduled_count} closure(s)) (edge, start→end, duration min):")
+                for c in sorted(closure_events, key=lambda z: z["start"]):
+                    sM, sS = divmod(c["start"], 60); eM, eS = divmod(c["end"], 60)
+                    print(
+                        f"  • {c['edge']}: {sM:02d}:{sS:02d} → {eM:02d}:{eS:02d}  "
+                        f"(~{(c['end'] - c['start']) // 60}m)"
+                    )
+            else:
+                print(
+                    f"[{day_label}] 🎲 Closure day but no edges selected "
+                    f"(candidates={len(todays_pool)}, edge_prob={cfg.closure_edge_prob:.2f})."
+                )
         else:
-            print(f"[{day_label}] 💤 No closures scheduled today.")
+            # Reasons why we might not schedule new closures:
+            if not closure_day_ok:
+                print(f"[{day_label}] 💤 Not a closure day (closure_day_period={cfg.closure_day_period}).")
+            elif not todays_pool:
+                print(f"[{day_label}] 💤 No candidate edges available for closures today.")
+            elif cfg.closure_edge_prob <= 0.0:
+                print(f"[{day_label}] 💤 closure_edge_prob={cfg.closure_edge_prob:.2f} → no closures by design.")
+
 
         # Add rollovers (t=0) if enabled and closures allowed
         rollovers = []
-        if cfg.allow_cross_day and closures_allowed_today and os.path.exists(cfg.rollover_json):
+        if cfg.allow_cross_day and closures_allowed_by_date and os.path.exists(cfg.rollover_json):
             try:
                 with open(cfg.rollover_json, "r", encoding="utf-8") as f:
                     rollovers = json.load(f)
@@ -897,5 +1027,34 @@ def run_closure_month_runner(cfg: MonthRunnerConfig) -> dict:
 # -------------------- CLI -------------------- #
 
 if __name__ == "__main__":
-    cfg = MonthRunnerConfig()  # defaults mirror your original script
+    # Test configuration for new closure features
+    cfg = MonthRunnerConfig(
+        # Run a short sequence of days so logs are easy to inspect
+        run_mode="days",
+        start_year=2025,
+        start_month=1,
+        start_day=1,
+        days_to_run=10,        # 10 consecutive days
+        sim_seconds=6 * 3600,  # 6 hours per day instead of 24h, faster test
+
+        # Make sure closures are allowed from the very first day
+        closure_global_start=None,
+        deferred_closure_start=None,
+
+        # New closure controls:
+        closure_pool_size=5,        # pick 5 edges once; only those can ever be closed
+        closure_day_period=2,       # every 2nd day is a closure day (idx 0,2,4,...)
+        closure_edge_prob=0.5,      # each candidate edge has 50% chance to close on closure days
+
+        late_closure_pool_size=2,   # 2 of the 5 edges are "late" edges
+        late_closure_start_frac=0.7,# late edges only appear in the last ~30% of days
+
+        # Optional: keep GUI off and use a fixed seed for reproducibility
+        use_gui=False,
+        seed=104,
+        run_dir="data/test",
+        net_dir="data/my_grid_sim",
+    )
+
     run_closure_month_runner(cfg)
+
