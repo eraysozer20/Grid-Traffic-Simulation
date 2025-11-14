@@ -650,12 +650,12 @@ def run_closure_month_runner(cfg: MonthRunnerConfig) -> dict:
 
     # Late subset: chosen once from the global set, never changes
     late_closure_ids = set()
-    if cfg.late_closure_pool_size and cfg.late_closure_pool_size > 0 and len(global_closure_ids) > 1:
-        # Enforce "subset" semantics: keep at least one early edge if possible
-        max_late_size = len(global_closure_ids) - 1
-        late_size = min(cfg.late_closure_pool_size, max_late_size)
-        if late_size > 0:
-            late_closure_ids = set(random.sample(global_closure_ids, late_size))
+    if cfg.late_closure_pool_size and cfg.late_closure_pool_size > 0:
+        if cfg.late_closure_pool_size >= len(global_closure_ids):
+            # All edges become "late" edges (no early edges at all)
+            late_closure_ids = set(global_closure_ids)
+        else:
+            late_closure_ids = set(random.sample(global_closure_ids, cfg.late_closure_pool_size))
 
     early_closure_ids = [eid for eid in global_closure_ids if eid not in late_closure_ids]
 
@@ -663,6 +663,7 @@ def run_closure_month_runner(cfg: MonthRunnerConfig) -> dict:
         f"🧩 Global closure ids: {len(global_closure_ids)} "
         f"(early={len(early_closure_ids)}, late={len(late_closure_ids)})"
     )
+
 
     # Pretty-print which exact edges were chosen (once per run)
     # Build a small lookup from edge id -> (from, to)
@@ -1042,11 +1043,11 @@ if __name__ == "__main__":
         deferred_closure_start=None,
 
         # New closure controls:
-        closure_pool_size=5,        # pick 5 edges once; only those can ever be closed
+        closure_pool_size=6,        # pick 5 edges once; only those can ever be closed
         closure_day_period=2,       # every 2nd day is a closure day (idx 0,2,4,...)
         closure_edge_prob=0.5,      # each candidate edge has 50% chance to close on closure days
 
-        late_closure_pool_size=2,   # 2 of the 5 edges are "late" edges
+        late_closure_pool_size=6,   # 2 of the 5 edges are "late" edges
         late_closure_start_frac=0.7,# late edges only appear in the last ~30% of days
 
         # Optional: keep GUI off and use a fixed seed for reproducibility
